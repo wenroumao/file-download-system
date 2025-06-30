@@ -2,9 +2,21 @@ from flask import Blueprint, request, jsonify, render_template_string
 from src.models.cdk import CDK, db
 import secrets
 import string
+import os
 from datetime import datetime
+from werkzeug.utils import secure_filename
 
 admin_bp = Blueprint('admin', __name__)
+
+# 允许的文件扩展名
+ALLOWED_EXTENSIONS = {'zip', 'exe', 'rar', '7z', 'tar', 'gz', 'pdf', 'doc', 'docx', 'txt'}
+# 最大文件大小 (100MB)
+MAX_FILE_SIZE = 100 * 1024 * 1024
+
+def allowed_file(filename):
+    """检查文件扩展名是否允许"""
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def generate_cdk_code():
     """生成随机CDK码"""
@@ -168,6 +180,22 @@ ADMIN_TEMPLATE = """
         </div>
         
         <div class="section">
+            <h2>文件上传</h2>
+            <div class="form-group">
+                <label for="fileInput">选择文件:</label>
+                <input type="file" id="fileInput" accept=".zip,.exe,.rar,.7z,.tar,.gz,.pdf,.doc,.docx,.txt">
+                <button onclick="uploadFile()" class="success">上传文件</button>
+            </div>
+            <div id="uploadMessage"></div>
+            <div id="uploadProgress" style="display: none;">
+                <div style="background: #f0f0f0; border-radius: 4px; overflow: hidden; margin: 10px 0;">
+                    <div id="progressBar" style="height: 20px; background: #007bff; width: 0%; transition: width 0.3s;"></div>
+                </div>
+                <div id="progressText">上传中...</div>
+            </div>
+        </div>
+        
+        <div class="section">
             <h2>生成CDK</h2>
             <div class="form-group">
                 <label for="count">生成数量:</label>
@@ -189,6 +217,78 @@ ADMIN_TEMPLATE = """
     </div>
 
     <script>
+        // 上传文件
+        async function uploadFile() {
+            const fileInput = document.getElementById('fileInput');
+            const messageDiv = document.getElementById('uploadMessage');
+            const progressDiv = document.getElementById('uploadProgress');
+            const progressBar = document.getElementById('progressBar');
+            const progressText = document.getElementById('progressText');
+            
+            if (!fileInput.files || fileInput.files.length === 0) {
+                messageDiv.innerHTML = '<div class="message error">请选择要上传的文件</div>';
+                return;
+            }
+            
+            const file = fileInput.files[0];
+            
+            // 检查文件大小 (100MB)
+            if (file.size > 100 * 1024 * 1024) {
+                messageDiv.innerHTML = '<div class="message error">文件大小不能超过100MB</div>';
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            try {
+                // 显示进度条
+                progressDiv.style.display = 'block';
+                messageDiv.innerHTML = '';
+                
+                const xhr = new XMLHttpRequest();
+                
+                // 上传进度
+                xhr.upload.addEventListener('progress', function(e) {
+                    if (e.lengthComputable) {
+                        const percentComplete = (e.loaded / e.total) * 100;
+                        progressBar.style.width = percentComplete + '%';
+                        progressText.textContent = `上传中... ${Math.round(percentComplete)}%`;
+                    }
+                });
+                
+                // 上传完成
+                xhr.addEventListener('load', function() {
+                    progressDiv.style.display = 'none';
+                    
+                    if (xhr.status === 200) {
+                        const data = JSON.parse(xhr.responseText);
+                        if (data.status === 'success') {
+                            messageDiv.innerHTML = `<div class="message success">${data.message}</div>`;
+                            fileInput.value = ''; // 清空文件选择
+                        } else {
+                            messageDiv.innerHTML = `<div class="message error">${data.message}</div>`;
+                        }
+                    } else {
+                        messageDiv.innerHTML = '<div class="message error">上传失败，请重试</div>';
+                    }
+                });
+                
+                // 上传错误
+                xhr.addEventListener('error', function() {
+                    progressDiv.style.display = 'none';
+                    messageDiv.innerHTML = '<div class="message error">上传失败，请检查网络连接</div>';
+                });
+                
+                xhr.open('POST', '/admin/api/upload');
+                xhr.send(formData);
+                
+            } catch (error) {
+                progressDiv.style.display = 'none';
+                messageDiv.innerHTML = '<div class="message error">上传失败</div>';
+            }
+        }
+        
         // 加载统计信息
         async function loadStats() {
             try {
@@ -399,4 +499,65 @@ def cleanup_used_cdks():
     except Exception as e:
         db.session.rollback()
         return jsonify({'status': 'error', 'message': f'删除失败: {str(e)}'}), 500
+
+@admin_bp.route('/api/upload', methods=['POST'])
+def upload_file():
+    """上传文件"""
+    try:
+        # 检查是否有文件
+        if 'file' not in request.files:
+            return jsonify({'status': 'error', 'message': '没有选择文件'}), 400
+        
+        file = request.files['file']
+        
+        # 检查文件名
+        if file.filename == '':
+            return jsonify({'status': 'error', 'message': '没有选择文件'}), 400
+        
+        # 检查文件类型
+        if not allowed_file(file.filename):
+            return jsonify({
+                'status': 'error', 
+                'message': f'不支持的文件类型。支持的类型: {", ".join(ALLOWED_EXTENSIONS)}'
+            }), 400
+        
+        # 检查文件大小
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)
+        
+        if file_size > MAX_FILE_SIZE:
+            return jsonify({
+                'status': 'error', 
+                'message': f'文件大小超过限制 ({MAX_FILE_SIZE // (1024*1024)}MB)'
+            }), 400
+        
+        # 安全的文件名
+        filename = secure_filename(file.filename)
+        
+        # 确保files目录存在
+        files_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'files')
+        os.makedirs(files_dir, exist_ok=True)
+        
+        # 保存文件
+        file_path = os.path.join(files_dir, filename)
+        file.save(file_path)
+        
+        # 格式化文件大小
+        if file_size < 1024:
+            size_str = f"{file_size} B"
+        elif file_size < 1024 * 1024:
+            size_str = f"{file_size / 1024:.1f} KB"
+        else:
+            size_str = f"{file_size / (1024 * 1024):.1f} MB"
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'文件 "{filename}" 上传成功 ({size_str})',
+            'filename': filename,
+            'size': file_size
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': f'上传失败: {str(e)}'}), 500
 
